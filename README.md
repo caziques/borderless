@@ -1,80 +1,111 @@
 # Borderless
 
-A minimal Mouse Without Borders–style KVM bridge for a **Mac + Windows** pair:
-one keyboard and mouse (attached to the Mac) controls both machines. Move the
-cursor off the edge of the Mac screen and it appears on the Windows screen;
-keyboard input and clipboard text follow it.
+A Mouse Without Borders–style software KVM for a **Mac and Windows** pair: one
+keyboard and mouse, attached to the Mac, control both machines. When you move
+the cursor off the edge of the Mac screen, it appears on the Windows screen.
+Keyboard input and the clipboard (text and images) follow it.
 
 ```
-┌──────────────┐   your LAN (TCP, JSON lines)   ┌────────────────┐
-│  Mac          │ ─────────────────────────────► │  Windows        │
-│ server_mac.py │   mouse / keys / clipboard     │ client_windows. │
-│ (captures)    │ ◄───────────────────────────── │ py (injects)    │
-└──────────────┘        clipboard back           └────────────────┘
+┌───────────────┐   your LAN, TLS-encrypted     ┌─────────────────┐
+│  Mac          │ ────────────────────────────► │  Windows        │
+│ server_mac.py │   mouse, keys, clipboard      │ client_windows. │
+│ (captures)    │ ◄──────────────────────────── │ py (injects)    │
+└───────────────┘   clipboard back              └─────────────────┘
 ```
 
-The keyboard/mouse must be physically attached to the **Mac** — capture runs
-there. The Windows machine only injects events.
+The keyboard and mouse must be attached to the **Mac**, because that's where
+input is captured. The Windows machine only injects events.
 
-## Setup — Mac (server)
+## Set up the Mac (server)
 
-```bash
-cd borderless
-python3 -m venv .venv
-.venv/bin/pip install -r requirements-mac.txt
-.venv/bin/python server_mac.py --token pick-a-secret
-```
+1. Install and start the server:
 
-On first run macOS will ask for permissions. Grant your terminal app both:
+   ```bash
+   cd borderless
+   python3 -m venv .venv
+   .venv/bin/pip install -r requirements-mac.txt
+   .venv/bin/python server_mac.py --win-side left
+   ```
 
-- **System Settings → Privacy & Security → Accessibility**
-- **System Settings → Privacy & Security → Input Monitoring**
+   Use `--win-side left` or `--win-side right` for the side of the Mac the
+   Windows machine is on.
 
-then restart the server. When macOS asks whether the app may accept incoming
-network connections, allow it.
+2. On first run, the server creates a TLS certificate and a **pairing key**,
+   and prints the key:
 
-Find the Mac's LAN IP with `ipconfig getifaddr en0`.
+   ```
+   [borderless] Pairing key — enter it on the Windows machine:
+   [borderless]     s3ub-2pnh-8pgk-ztnp-gw8y-cktv
+   ```
 
-## Setup — Windows (client)
+   To see the key again later, run `server_mac.py --show-key`.
 
-Install Python 3 from python.org (tick "Add to PATH"), then:
+3. macOS asks for permissions on first run. Grant your terminal app both of
+   these, then restart the server:
 
-```
-cd borderless
-python -m pip install pynput
-python client_windows.py <MAC_IP> --token pick-a-secret
-```
+   - **System Settings > Privacy & Security > Accessibility**
+   - **System Settings > Privacy & Security > Input Monitoring**
 
-(`pynput` is the only dependency — clipboard access uses the built-in Windows
-API. Use `python -m pip` rather than bare `pip` so the package lands in the
-same Python you run the script with.)
+   If macOS asks whether the app can accept incoming network connections,
+   allow it.
 
-No inbound firewall rule is needed on Windows — the client dials out to the
+4. Find the Mac's address with `ipconfig getifaddr en0`, or its hostname with
+   `scutil --get LocalHostName` (use it as `<name>.local`).
+
+## Set up Windows (client)
+
+1. Install Python 3 from python.org, and select **Add python.exe to PATH**
+   during installation.
+2. Download the client and its protocol module into a folder:
+
+   ```
+   curl -O https://raw.githubusercontent.com/caziques/borderless/main/client_windows.py
+   curl -O https://raw.githubusercontent.com/caziques/borderless/main/protocol.py
+   ```
+
+3. Install the one dependency:
+
+   ```
+   python -m pip install pynput
+   ```
+
+4. Start the client with the Mac's address and the pairing key:
+
+   ```
+   python client_windows.py <MAC_ADDRESS> --key <PAIRING_KEY>
+   ```
+
+   The client saves both to `client_config.json`, so later you can start it
+   with `python client_windows.py`.
+
+Windows needs no inbound firewall rule, because the client connects out to the
 Mac.
 
-## Using it
+## Use it
 
-- **Which side is Windows on?** Set it at launch with `--win-side left` or
-  `--win-side right` (default `right`). The chosen side is saved to
-  `config.json`, so later runs reuse it even without the flag.
-- **Switch to Windows:** push the cursor off that edge of the Mac screen.
-- **Switch back to the Mac:** push the cursor off the opposite (left) edge of
-  the Windows screen.
-- **Panic/toggle hotkey:** `Ctrl+Alt+Q` flips control at any time — use it if
-  the cursor ever gets stuck on the wrong side.
-- **Clipboard:** copy text on either machine, paste on the other (text only).
-- **Cmd key:** while controlling Windows, Mac `Cmd` acts as `Ctrl` so
-  Cmd+C/Cmd+V work as expected. Pass `--no-swap-cmd-ctrl` on the client to get
-  the Windows key instead.
-- **Option key:** acts as `Alt`, so Option+Tab is Alt+Tab and Option+F4 is
-  Alt+F4.
+- **Switch to Windows:** push the cursor off the Mac edge you chose with
+  `--win-side`. That edge is saved in `config.json`.
+- **Switch back to the Mac:** push the cursor off the Windows edge that faces
+  the Mac.
+- **Toggle hotkey:** `Ctrl+Alt+Q` switches control at any time. Use it if the
+  cursor is ever on the wrong side.
+- **Multiple displays:** both sides support them. On the Mac, the cursor moves
+  between your displays normally and hands off only at the outer edge. On
+  Windows, the cursor moves across all displays, and it returns to the Mac
+  only from the display edge that faces the Mac.
+- **Clipboard:** copy text or an image on either machine, and paste it on the
+  other. If the clipboard holds both text and an image, the text is sent.
+- **Cmd key:** while you control Windows, Mac `Cmd` acts as `Ctrl`, so
+  Cmd+C and Cmd+V work. To send the Windows key instead, start the client
+  with `--no-swap-cmd-ctrl`.
+- **Option key:** acts as `Alt`, so Option+Tab is Alt+Tab.
 - **Keyboard layout:** keys are sent as physical key positions (scan codes),
   and Windows applies its own keyboard layout. Set the Windows layout to match
   your Mac keyboard.
-- **Dropped connections:** the Mac and Windows machines exchange a heartbeat
-  every second. If the network drops while Windows has control, the Mac takes
-  control back after about 4 seconds, and Windows releases any keys or mouse
-  buttons that were held down. The client then reconnects on its own.
+- **Dropped connections:** the two machines exchange a heartbeat every second.
+  If the network drops while Windows has control, the Mac takes control back
+  after about 4 seconds, and Windows releases any held keys or mouse buttons.
+  The client reconnects on its own.
 
 ## Options
 
@@ -82,40 +113,61 @@ Server (`server_mac.py`):
 
 | Flag | Default | Meaning |
 |---|---|---|
+| `--win-side` | right | Side of the Mac the Windows machine is on |
 | `--port` | 24801 | TCP port to listen on |
-| `--win-side` | right | which side of the Mac the Windows machine sits on |
-| `--token` | (none) | shared secret the client must present |
-| `--speed` | 1.0 | mouse speed multiplier on the Windows screen |
+| `--speed` | 1.0 | Mouse speed multiplier on the Windows screen |
+| `--show-key` | | Print the saved pairing key |
+| `--new-key` | | Generate a new pairing key |
+| `--key` | | Use a specific pairing key |
 
 Client (`client_windows.py`):
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--port` | 24801 | must match the server |
-| `--token` | (none) | must match the server |
-| `--invert-scroll` | off | flip scroll direction if it feels backwards |
-| `--no-swap-cmd-ctrl` | off | send Cmd as the Windows key instead of Ctrl |
+| `--key` | saved | Pairing key from the Mac |
+| `--port` | 24801 | Must match the server |
+| `--invert-scroll` | off | Reverse the scroll direction |
+| `--no-swap-cmd-ctrl` | off | Send Cmd as the Windows key instead of Ctrl |
+| `--size` | detected | Override the detected desktop size, for example `1920x1080` |
 
-## Security notes
+## Security
 
-- Traffic is **not encrypted**. Run it only on a trusted home LAN, or better,
-  over a [Tailscale](https://tailscale.com) connection between the two
-  machines (then use the Tailscale IP as `<MAC_IP>`).
-- Always set `--token`; without it, anything on the network that can reach the
-  port can receive your keystrokes' destination and send clipboard text.
+- **Encryption:** all traffic uses TLS 1.2 or later, including keystrokes and
+  clipboard contents.
+- **Pairing:** the Mac's certificate is self-signed. Instead of a certificate
+  authority, both machines prove they know the pairing key with an HMAC that
+  also covers the certificate's fingerprint. A machine in the middle presents
+  a different certificate, so the proofs don't match and the connection is
+  refused.
+- **Pairing key:** 24 random characters, about 119 bits. If you think someone
+  has seen it, run `server_mac.py --new-key` and update the client.
+- **Secrets on disk:** `config.json` (pairing key), `client_config.json`,
+  `tls_key.pem`, and `tls_cert.pem` stay on your machines and are excluded
+  from Git.
+
+## How it works
+
+- **Mouse:** the Mac sends cursor positions on a 0–65535 scale across the
+  whole Windows desktop, the scale Windows' `SendInput` uses. This makes
+  positions independent of resolution and display scaling.
+- **Keyboard:** the Mac sends physical macOS key codes, which the client maps
+  to Windows scan codes.
+- **Clipboard:** data is compressed. Items up to 1 MB compressed travel on the
+  main connection. Larger items go over a separate short-lived connection, so
+  they never delay mouse and keyboard input. Images travel in the Windows DIB
+  format, and the Mac converts them to and from PNG and TIFF.
 
 ## Limitations
 
-- One direction: keyboard/mouse on the Mac drive both machines (like Mouse
-  Without Borders's primary machine).
-- Multiple **Mac** displays work: the cursor travels across them and only hands
-  off at the outer edge, returning to the same display on the way back. The
-  **Windows** side uses its primary display only.
-- Text clipboard only — no files or images, no drag-and-drop across machines.
-- Injected input can't reach elevated (UAC/admin) windows on Windows unless
-  the client itself runs as administrator.
-- Media keys (volume, play/pause) are forwarded as Windows media keys. The Mac
-  `fn` key has no Windows equivalent and is not forwarded.
+- Keyboard and mouse input goes one way: the Mac's devices control both
+  machines.
+- The clipboard is limited to text and images up to 100 MB. Files and drag
+  and drop between machines aren't supported.
+- Image transparency isn't kept between machines.
+- Injected input can't reach elevated (administrator) windows on Windows
+  unless the client runs as administrator.
+- Media keys (volume, play/pause) arrive as Windows media keys. The Mac `fn`
+  key has no Windows equivalent and isn't forwarded.
 - On ISO keyboards, the `§` key maps to the extra ISO key next to left Shift.
-- Heartbeat and scan codes need both sides updated. A mix of old and new
-  versions still works, falling back to the old behavior.
+- Version 2 (TLS) doesn't work with older clients or servers. Update both
+  machines together.

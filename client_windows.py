@@ -1,24 +1,34 @@
 #!/usr/bin/env python3
 """Borderless client — run on the Windows machine.
 
-Connects to the Mac server, receives mouse/keyboard events, and injects them
-locally. Also syncs clipboard text in both directions. Reconnects automatically
-if the connection drops.
+Connects to the Mac server over TLS, receives mouse/keyboard events, and injects
+them locally. Also syncs clipboard text and images in both directions.
+Reconnects automatically if the connection drops.
+
+Needs protocol.py from the same folder.
 """
 
 import argparse
 import ctypes
 import ctypes.wintypes as wintypes
 import json
+import os
 import socket
+import ssl
+import sys
 import threading
 import time
 
 from pynput import keyboard, mouse
 
-HEARTBEAT_TIMEOUT = 4.0   # seconds of silence from the Mac before reconnecting
+import protocol as P
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(HERE, "client_config.json")
 
 CF_UNICODETEXT = 13
+CF_DIB = 8
+CF_DIBV5 = 17
 GMEM_MOVEABLE = 0x0002
 
 _user32 = ctypes.windll.user32
@@ -26,49 +36,93 @@ _kernel32 = ctypes.windll.kernel32
 _user32.GetClipboardData.restype = ctypes.c_void_p
 _user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
 _user32.SetClipboardData.restype = ctypes.c_void_p
+_user32.GetClipboardSequenceNumber.restype = wintypes.DWORD
 _kernel32.GlobalAlloc.restype = ctypes.c_void_p
 _kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
 _kernel32.GlobalLock.restype = ctypes.c_void_p
 _kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
 _kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+_kernel32.GlobalSize.argtypes = [ctypes.c_void_p]
+_kernel32.GlobalSize.restype = ctypes.c_size_t
 
 
-def clipboard_get():
-    """Read clipboard text, or None if the clipboard is busy/unavailable."""
-    if not _user32.OpenClipboard(0):
-        return None
+# ---------------- clipboard ----------------
+
+class ClipboardBusy(Exception):
+    pass
+
+
+def _open_clipboard(retries=1):
+    for attempt in range(retries):
+        if _user32.OpenClipboard(0):
+            return
+        time.sleep(0.05)
+    raise ClipboardBusy()
+
+
+def clipboard_sequence():
+    return _user32.GetClipboardSequenceNumber()
+
+
+def clipboard_read():
+    """Return ("text", utf-8 bytes), ("dib", bytes), or None."""
+    _open_clipboard()
     try:
-        handle = _user32.GetClipboardData(CF_UNICODETEXT)
-        if not handle:
-            return ""
-        ptr = _kernel32.GlobalLock(handle)
-        if not ptr:
-            return None
-        try:
-            return ctypes.c_wchar_p(ptr).value or ""
-        finally:
-            _kernel32.GlobalUnlock(handle)
+        if _user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+            handle = _user32.GetClipboardData(CF_UNICODETEXT)
+            ptr = _kernel32.GlobalLock(handle) if handle else None
+            if not ptr:
+                return None
+            try:
+                text = ctypes.c_wchar_p(ptr).value or ""
+            finally:
+                _kernel32.GlobalUnlock(handle)
+            return "text", text.encode("utf-8")
+        if _user32.IsClipboardFormatAvailable(CF_DIB):
+            handle = _user32.GetClipboardData(CF_DIB)
+            ptr = _kernel32.GlobalLock(handle) if handle else None
+            if not ptr:
+                return None
+            try:
+                data = ctypes.string_at(ptr, _kernel32.GlobalSize(handle))
+            finally:
+                _kernel32.GlobalUnlock(handle)
+            return "dib", data
+        return None
     finally:
         _user32.CloseClipboard()
 
 
-def clipboard_set(text):
-    if not _user32.OpenClipboard(0):
-        return
+def clipboard_write(fmt, data):
+    """Replace the clipboard; returns the new clipboard sequence number."""
+    if fmt == "text":
+        buf = ctypes.create_unicode_buffer(data.decode("utf-8", "replace"))
+        payload = ctypes.string_at(buf, ctypes.sizeof(buf))
+        fmt_id = CF_UNICODETEXT
+    elif fmt == "dib":
+        payload = data
+        # macOS sends a BITMAPV5HEADER (124 bytes); Windows synthesizes the
+        # plain CF_DIB format from CF_DIBV5 for apps that only read that.
+        header_size = int.from_bytes(data[0:4], "little")
+        fmt_id = CF_DIBV5 if header_size == 124 else CF_DIB
+    else:
+        raise ValueError(f"unknown clipboard format {fmt!r}")
+    _open_clipboard(retries=20)
     try:
         _user32.EmptyClipboard()
-        buf = ctypes.create_unicode_buffer(text)
-        size = ctypes.sizeof(buf)
-        handle = _kernel32.GlobalAlloc(GMEM_MOVEABLE, size)
+        handle = _kernel32.GlobalAlloc(GMEM_MOVEABLE, len(payload))
         if not handle:
-            return
+            raise MemoryError("GlobalAlloc failed")
         ptr = _kernel32.GlobalLock(handle)
-        ctypes.memmove(ptr, buf, size)
+        ctypes.memmove(ptr, payload, len(payload))
         _kernel32.GlobalUnlock(handle)
-        if not _user32.SetClipboardData(CF_UNICODETEXT, handle):
+        if not _user32.SetClipboardData(fmt_id, handle):
             _kernel32.GlobalFree(handle)
+            raise OSError("SetClipboardData failed")
     finally:
         _user32.CloseClipboard()
+    return clipboard_sequence()
+
 
 BUTTONS = {0: mouse.Button.left, 1: mouse.Button.right, 2: mouse.Button.middle}
 
@@ -132,10 +186,14 @@ MAC_TO_SCAN = {
 }
 MAC_CMD_L, MAC_CMD_R, MAC_CAPS_LOCK = 55, 54, 57
 
+INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
 KEYEVENTF_EXTENDEDKEY = 0x0001
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_SCANCODE = 0x0008
+MOUSEEVENTF_MOVE = 0x0001
+MOUSEEVENTF_VIRTUALDESK = 0x4000
+MOUSEEVENTF_ABSOLUTE = 0x8000
 
 
 class KEYBDINPUT(ctypes.Structure):
@@ -174,8 +232,21 @@ def send_scan(scan, extended, down):
     inp.u.ki = KEYBDINPUT(wVk=0, wScan=scan, dwFlags=flags, time=0, dwExtraInfo=0)
     _user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
 
+
+def move_abs(nx, ny):
+    """Move the cursor to (nx, ny) on the 0–65535 virtual-desktop scale."""
+    inp = INPUT(type=INPUT_MOUSE)
+    inp.u.mi = MOUSEINPUT(dx=nx, dy=ny, mouseData=0,
+                          dwFlags=MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE
+                          | MOUSEEVENTF_VIRTUALDESK,
+                          time=0, dwExtraInfo=0)
+    _user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+
+
+# ---------------- displays ----------------
+
 def set_dpi_aware():
-    """Opt out of DPI virtualization so cursor coords are real pixels."""
+    """Opt out of DPI virtualization so display coords are real pixels."""
     try:
         # Per-monitor v2 (Windows 10 1703+)
         if _user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
@@ -193,53 +264,59 @@ def set_dpi_aware():
         pass
 
 
-class DEVMODEW(ctypes.Structure):
-    _fields_ = [
-        ("dmDeviceName", ctypes.c_wchar * 32),
-        ("dmSpecVersion", ctypes.c_ushort),
-        ("dmDriverVersion", ctypes.c_ushort),
-        ("dmSize", ctypes.c_ushort),
-        ("dmDriverExtra", ctypes.c_ushort),
-        ("dmFields", ctypes.c_ulong),
-        ("dmPositionX", ctypes.c_long),
-        ("dmPositionY", ctypes.c_long),
-        ("dmDisplayOrientation", ctypes.c_ulong),
-        ("dmDisplayFixedOutput", ctypes.c_ulong),
-        ("dmColor", ctypes.c_short),
-        ("dmDuplex", ctypes.c_short),
-        ("dmYResolution", ctypes.c_short),
-        ("dmTTOption", ctypes.c_short),
-        ("dmCollate", ctypes.c_short),
-        ("dmFormName", ctypes.c_wchar * 32),
-        ("dmLogPixels", ctypes.c_ushort),
-        ("dmBitsPerPel", ctypes.c_ulong),
-        ("dmPelsWidth", ctypes.c_ulong),
-        ("dmPelsHeight", ctypes.c_ulong),
-        ("dmDisplayFlags", ctypes.c_ulong),
-        ("dmDisplayFrequency", ctypes.c_ulong),
-        ("dmICMMethod", ctypes.c_ulong),
-        ("dmICMIntent", ctypes.c_ulong),
-        ("dmMediaType", ctypes.c_ulong),
-        ("dmDitherType", ctypes.c_ulong),
-        ("dmReserved1", ctypes.c_ulong),
-        ("dmReserved2", ctypes.c_ulong),
-        ("dmPanningWidth", ctypes.c_ulong),
-        ("dmPanningHeight", ctypes.c_ulong),
-    ]
+def monitor_rects():
+    """Every display as (left, top, width, height) in physical pixels."""
+    rects = []
+    proto = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
+    callback_type = proto(wintypes.BOOL, wintypes.HANDLE, wintypes.HDC,
+                          ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
 
+    def collect(hmon, hdc, rect, data):
+        r = rect.contents
+        rects.append((r.left, r.top, r.right - r.left, r.bottom - r.top))
+        return True
 
-def screen_size():
-    """Physical resolution of the primary display, immune to DPI scaling."""
-    ENUM_CURRENT_SETTINGS = -1
-    dm = DEVMODEW()
-    dm.dmSize = ctypes.sizeof(DEVMODEW)
     try:
-        if _user32.EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS,
-                                        ctypes.byref(dm)) and dm.dmPelsWidth:
-            return int(dm.dmPelsWidth), int(dm.dmPelsHeight)
+        _user32.EnumDisplayMonitors(None, None, callback_type(collect), 0)
     except Exception:
         pass
-    return _user32.GetSystemMetrics(0), _user32.GetSystemMetrics(1)
+    if not rects:
+        rects = [(0, 0, _user32.GetSystemMetrics(0), _user32.GetSystemMetrics(1))]
+    return rects
+
+
+def desktop_layout(size_override=""):
+    """Displays relative to the virtual desktop's top-left corner."""
+    if size_override:
+        w, h = (int(v) for v in size_override.lower().split("x"))
+        return {"vw": w, "vh": h, "mons": [[0, 0, w, h]]}
+    rects = monitor_rects()
+    vx = min(r[0] for r in rects)
+    vy = min(r[1] for r in rects)
+    vw = max(r[0] + r[2] for r in rects) - vx
+    vh = max(r[1] + r[3] for r in rects) - vy
+    mons = sorted([r[0] - vx, r[1] - vy, r[2], r[3]] for r in rects)
+    return {"vw": vw, "vh": vh, "mons": mons}
+
+
+# ---------------- config ----------------
+
+def load_config():
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(values):
+    cfg = load_config()
+    cfg.update(values)
+    try:
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(cfg, f, indent=2)
+    except OSError:
+        pass
 
 
 class Client:
@@ -247,20 +324,20 @@ class Client:
         self.args = args
         self.mouse = mouse.Controller()
         self.kb = keyboard.Controller()
-        if args.size:
-            self.w, self.h = (int(v) for v in args.size.lower().split("x"))
-        else:
-            self.w, self.h = screen_size()
-        self.sock = None
-        self.sock_lock = threading.Lock()
-        self.send_lock = threading.Lock()   # pong and clipboard share the socket
-        self.last_clip_sent = None
-        self.last_clip_received = None
+        self.auth_key = P.derive_auth_key(args.key)
+        self.tls_ctx = P.client_context()
+        self.layout = desktop_layout(args.size)
+        self.chan = None
+        self.chan_lock = threading.Lock()
         # Track what we've actually pressed so "reset" releases only those —
         # a blind release injects stray "up" events (a lone right-up opens a
         # context menu; a lone Win-up opens the Start menu).
         self.pressed_buttons = set()
         self.pressed_keys = set()
+
+        self.clip_lock = threading.Lock()
+        self.clip_last_digest = None   # last clipboard content sent or received
+        self.clip_own_seq = None       # sequence number of our own write
 
     # ---------------- key mapping ----------------
 
@@ -291,7 +368,7 @@ class Client:
     def handle(self, msg):
         t = msg.get("t")
         if t == "move":
-            self.mouse.position = (msg["x"], msg["y"])
+            move_abs(int(msg["x"]), int(msg["y"]))
         elif t == "click":
             btn = BUTTONS.get(msg.get("b", 0), mouse.Button.left)
             if msg.get("d"):
@@ -307,47 +384,49 @@ class Client:
                 dy, dx = -dy, -dx
             self.mouse.scroll(dx, dy)
         elif t == "key":
-            down = bool(msg.get("d"))
-            scan = self.resolve_scan(msg["mvk"]) if "mvk" in msg else None
-            if scan is not None:
-                if msg["mvk"] == MAC_CAPS_LOCK:
-                    # macOS reports Caps Lock as "down" when it turns on and
-                    # "up" when it turns off; Windows toggles on every press,
-                    # so each Mac event becomes one full tap.
-                    send_scan(*scan, True)
-                    send_scan(*scan, False)
-                    return
-                send_scan(*scan, down)
-                if down:
-                    self.pressed_keys.add(scan)
-                else:
-                    self.pressed_keys.discard(scan)
-                return
-            key = self.resolve_key(msg)
-            if key is None:
-                return
-            try:
-                if down:
-                    self.kb.press(key)
-                    self.pressed_keys.add(key)
-                else:
-                    self.kb.release(key)
-                    self.pressed_keys.discard(key)
-            except Exception:
-                pass
+            self.handle_key(msg)
         elif t == "reset":
             self.release_all()
         elif t == "ping":
             self.send({"t": "pong"})
         elif t == "clip":
-            text = msg.get("text", "")
-            if text != self.last_clip_received:
-                self.last_clip_received = text
-                self.last_clip_sent = text
-                try:
-                    clipboard_set(text)
-                except Exception:
-                    pass
+            try:
+                self.apply_clip(msg["fmt"], P.decompress(P.unb64(msg["data"])))
+            except Exception as exc:
+                print(f"[borderless] could not apply clipboard from the Mac: {exc}")
+        elif t == "clipoffer":
+            threading.Thread(target=self.fetch_clip, args=(msg.get("id"),),
+                             daemon=True).start()
+
+    def handle_key(self, msg):
+        down = bool(msg.get("d"))
+        scan = self.resolve_scan(msg["mvk"]) if "mvk" in msg else None
+        if scan is not None:
+            if msg["mvk"] == MAC_CAPS_LOCK:
+                # macOS reports Caps Lock as "down" when it turns on and
+                # "up" when it turns off; Windows toggles on every press,
+                # so each Mac event becomes one full tap.
+                send_scan(*scan, True)
+                send_scan(*scan, False)
+                return
+            send_scan(*scan, down)
+            if down:
+                self.pressed_keys.add(scan)
+            else:
+                self.pressed_keys.discard(scan)
+            return
+        key = self.resolve_key(msg)
+        if key is None:
+            return
+        try:
+            if down:
+                self.kb.press(key)
+                self.pressed_keys.add(key)
+            else:
+                self.kb.release(key)
+                self.pressed_keys.discard(key)
+        except Exception:
+            pass
 
     def release_all(self):
         # Release only what we're actually holding, so no stray up-events
@@ -371,97 +450,203 @@ class Client:
     # ---------------- clipboard ----------------
 
     def clip_loop(self):
-        try:
-            self.last_clip_sent = clipboard_get()
-        except Exception:
-            pass
+        last_seq = clipboard_sequence()
         while True:
-            time.sleep(1.0)
+            time.sleep(0.5)
+            seq = clipboard_sequence()
+            if seq == last_seq:
+                continue
             try:
-                text = clipboard_get()
-            except Exception:
+                item = clipboard_read()
+            except ClipboardBusy:
+                continue  # another app has it open; try again next round
+            except Exception as exc:
+                print(f"[borderless] could not read the clipboard: {exc}")
+                last_seq = seq
                 continue
-            if text is None or text == self.last_clip_sent:
+            last_seq = seq
+            with self.clip_lock:
+                if seq == self.clip_own_seq:
+                    continue
+            if item is None:
                 continue
-            self.last_clip_sent = text
-            if text != self.last_clip_received:
-                self.send({"t": "clip", "text": text})
+            fmt, data = item
+            if len(data) > P.MAX_CLIP_SIZE:
+                print("[borderless] clipboard too large to share")
+                continue
+            digest = P.clip_digest(fmt, data)
+            with self.clip_lock:
+                if digest == self.clip_last_digest:
+                    continue
+                self.clip_last_digest = digest
+            self.offer_clip(fmt, data)
+
+    def offer_clip(self, fmt, data):
+        if self.chan is None:
+            return
+        blob = P.compress(data)
+        if len(blob) <= P.INLINE_CLIP_LIMIT:
+            self.send({"t": "clip", "fmt": fmt, "data": P.b64(blob)})
+        else:
+            # Too big for the main link: push it over a separate connection.
+            threading.Thread(target=self.push_clip, args=(fmt, blob),
+                             daemon=True).start()
+        print(f"[borderless] clipboard → Mac ({fmt}, {P.human_size(len(data))})")
+
+    def apply_clip(self, fmt, data):
+        with self.clip_lock:
+            self.clip_last_digest = P.clip_digest(fmt, data)
+            self.clip_own_seq = clipboard_write(fmt, data)
+        print(f"[borderless] clipboard ← Mac ({fmt}, {P.human_size(len(data))})")
+
+    def data_connection(self):
+        chan = P.connect_tls(self.args.server, self.args.port, self.tls_ctx)
+        try:
+            P.authenticate_client(chan, self.auth_key, {"role": "data"})
+        except Exception:
+            chan.close()
+            raise
+        return chan
+
+    def fetch_clip(self, offer_id):
+        chan = None
+        try:
+            chan = self.data_connection()
+            chan.send({"t": "fetch", "id": offer_id})
+            header = chan.recv_msg(timeout=30)
+            if not header.get("ok"):
+                return
+            size = int(header["size"])
+            if not 0 < size <= P.MAX_CLIP_SIZE:
+                return
+            blob = chan.recv_exact(size, timeout=120)
+            chan.send({"t": "done"})
+            self.apply_clip(header["fmt"], P.decompress(blob))
+        except Exception as exc:
+            print(f"[borderless] clipboard download failed: {exc}")
+        finally:
+            if chan is not None:
+                chan.close()
+
+    def push_clip(self, fmt, blob):
+        chan = None
+        try:
+            chan = self.data_connection()
+            chan.send({"t": "push", "fmt": fmt, "size": len(blob)})
+            chan.send_bytes(blob, timeout=120)
+            chan.recv_msg(timeout=60)  # "done": the Mac has everything
+        except Exception as exc:
+            print(f"[borderless] clipboard upload failed: {exc}")
+        finally:
+            if chan is not None:
+                chan.close()
+
+    # ---------------- connection ----------------
 
     def send(self, msg):
-        with self.sock_lock:
-            sock = self.sock
-        if sock is None:
+        with self.chan_lock:
+            chan = self.chan
+        if chan is None:
             return
-        data = (json.dumps(msg, separators=(",", ":")) + "\n").encode()
         try:
-            with self.send_lock:
-                sock.sendall(data)
-        except OSError:
-            pass
+            chan.send(msg, timeout=5.0)
+        except (OSError, ConnectionError):
+            chan.close()
 
-    # ---------------- lifecycle ----------------
+    def screens_loop(self):
+        """Tell the Mac when displays are added, removed, or rearranged."""
+        while True:
+            time.sleep(3.0)
+            if self.args.size:
+                continue
+            try:
+                layout = desktop_layout()
+            except Exception:
+                continue
+            if layout != self.layout:
+                self.layout = layout
+                print(f"[borderless] displays changed: {layout['vw']}x{layout['vh']} "
+                      f"on {len(layout['mons'])} display(s)")
+                self.send({"t": "screens", **layout})
 
     def run(self):
-        print(f"[borderless] windows screen: {self.w}x{self.h}")
+        print(f"[borderless] Windows desktop: {self.layout['vw']}x{self.layout['vh']} "
+              f"on {len(self.layout['mons'])} display(s)")
         threading.Thread(target=self.clip_loop, daemon=True).start()
+        threading.Thread(target=self.screens_loop, daemon=True).start()
         while True:
             try:
                 self.connect_once()
+            except P.AuthError as exc:
+                print(f"[borderless] pairing failed: {exc}")
+                print("[borderless] check the key: on the Mac, run "
+                      "server_mac.py --show-key, then start this client "
+                      "with --key <key>")
+                sys.exit(2)
             except socket.timeout:
                 print(f"[borderless] no heartbeat from the Mac for "
-                      f"{HEARTBEAT_TIMEOUT:.0f}s; reconnecting in 3s")
+                      f"{P.HEARTBEAT_TIMEOUT:.0f}s; reconnecting in 3s")
+            except ssl.SSLError as exc:
+                print(f"[borderless] TLS failed ({exc}). Is server_mac.py up to "
+                      f"date? Retrying in 3s")
             except (OSError, ConnectionError) as exc:
                 print(f"[borderless] connection lost ({exc}); retrying in 3s")
-            with self.sock_lock:
-                sock, self.sock = self.sock, None
-            if sock is not None:
-                try:
-                    sock.close()
-                except OSError:
-                    pass
+            with self.chan_lock:
+                chan, self.chan = self.chan, None
+            if chan is not None:
+                chan.close()
             # Don't leave keys or buttons held down if the link died mid-press.
             self.release_all()
             time.sleep(3)
 
     def connect_once(self):
         print(f"[borderless] connecting to {self.args.server}:{self.args.port} ...")
-        sock = socket.create_connection((self.args.server, self.args.port), timeout=10)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        sock.settimeout(None)
-        with self.sock_lock:
-            self.sock = sock
-        self.send({"t": "hello", "token": self.args.token,
-                   "w": self.w, "h": self.h, "hb": 1})
-        print("[borderless] connected — waiting for the Mac to hand over control")
-        f = sock.makefile("r", encoding="utf-8", newline="\n")
-        heartbeat_seen = False
-        for line in f:
-            try:
-                msg = json.loads(line)
-            except ValueError:
-                continue
-            if msg.get("t") == "ping" and not heartbeat_seen:
-                # Only enforce the read timeout once the server proves it
-                # sends pings, so an older server doesn't cause reconnect loops.
-                heartbeat_seen = True
-                sock.settimeout(HEARTBEAT_TIMEOUT)
-            self.handle(msg)
-        raise ConnectionError("server closed the connection")
+        chan = P.connect_tls(self.args.server, self.args.port, self.tls_ctx)
+        try:
+            P.authenticate_client(chan, self.auth_key,
+                                  {"role": "main", **self.layout})
+        except Exception:
+            chan.close()
+            raise
+        with self.chan_lock:
+            self.chan = chan
+        print("[borderless] connected and paired (TLS) — waiting for the Mac "
+              "to hand over control")
+        while True:
+            self.handle(chan.recv_msg(timeout=P.HEARTBEAT_TIMEOUT))
 
 
 def main():
+    cfg = load_config()
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("server", help="IP or hostname of the Mac running server_mac.py")
-    p.add_argument("--port", type=int, default=24801, help="TCP port (default 24801)")
-    p.add_argument("--token", default="", help="shared secret; must match the server")
+    p.add_argument("server", nargs="?", default=cfg.get("server"),
+                   help="IP or hostname of the Mac (saved for next time)")
+    p.add_argument("--key", default=cfg.get("key"),
+                   help="pairing key shown by server_mac.py (saved for next time)")
+    p.add_argument("--port", type=int, default=cfg.get("port", 24801),
+                   help="TCP port (default 24801)")
     p.add_argument("--invert-scroll", action="store_true",
                    help="flip scroll direction if it feels backwards")
     p.add_argument("--size", default="",
-                   help="override detected screen size, e.g. --size 1920x1080")
+                   help="override the detected desktop, e.g. --size 1920x1080")
     p.add_argument("--no-swap-cmd-ctrl", dest="swap_cmd_ctrl", action="store_false",
                    help="send Mac Cmd as the Windows key instead of Ctrl")
+    p.add_argument("--token", help=argparse.SUPPRESS)
     p.set_defaults(swap_cmd_ctrl=True)
     args = p.parse_args()
+
+    if args.token:
+        p.error("--token is replaced by the pairing key: use --key <key> "
+                "(run server_mac.py --show-key on the Mac to see it)")
+    if not args.server:
+        p.error("give the Mac's IP address or hostname, for example: "
+                "python client_windows.py 192.168.1.20 --key <key>")
+    if not args.key or not P.key_is_valid(args.key):
+        p.error("a valid pairing key is required: --key <key> "
+                "(run server_mac.py --show-key on the Mac to see it)")
+    args.key = P.format_key(args.key)
+    save_config({"server": args.server, "key": args.key, "port": args.port})
+
     set_dpi_aware()
     Client(args).run()
 

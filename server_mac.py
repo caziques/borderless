@@ -3,7 +3,8 @@
 
 Captures mouse and keyboard input. When the cursor crosses the configured screen
 edge, input is suppressed locally and streamed to the Windows client instead,
-Mouse Without Borders style. Clipboard text is synced in both directions.
+Mouse Without Borders style. Clipboard text and images are synced in both
+directions. The connection is TLS-encrypted and paired with a shared key.
 
 Hotkey: Ctrl+Alt+Q toggles control between the Mac and the Windows machine.
 """
@@ -12,19 +13,26 @@ import argparse
 import json
 import os
 import queue
+import shutil
 import socket
+import ssl
 import subprocess
-import sys
 import threading
 import time
 
 import Quartz
+from AppKit import (NSBitmapImageFileTypeBMP, NSBitmapImageFileTypePNG,
+                    NSBitmapImageRep, NSPasteboard, NSPasteboardTypePNG,
+                    NSPasteboardTypeString, NSPasteboardTypeTIFF)
+from Foundation import NSData
 from pynput import keyboard, mouse
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+import protocol as P
 
-HEARTBEAT_INTERVAL = 1.0     # seconds between pings to the client
-HEARTBEAT_TIMEOUT = 4.0      # silence after which the client is considered gone
+HERE = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(HERE, "config.json")
+CERT_PATH = os.path.join(HERE, "tls_cert.pem")
+KEY_PATH = os.path.join(HERE, "tls_key.pem")
 
 
 def load_config():
@@ -35,14 +43,34 @@ def load_config():
         return {}
 
 
-def save_config(values):
+def save_config(values, remove=()):
     cfg = load_config()
     cfg.update(values)
+    for name in remove:
+        cfg.pop(name, None)
     try:
         with open(CONFIG_PATH, "w") as f:
             json.dump(cfg, f, indent=2)
+        os.chmod(CONFIG_PATH, 0o600)
     except OSError:
         pass
+
+
+def ensure_certificate():
+    """Create the self-signed TLS certificate on first run."""
+    if os.path.exists(CERT_PATH) and os.path.exists(KEY_PATH):
+        return
+    openssl = shutil.which("openssl") or "/usr/bin/openssl"
+    print("[borderless] creating a TLS certificate for this Mac ...")
+    subprocess.run(
+        [openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+         "-keyout", KEY_PATH, "-out", CERT_PATH, "-days", "3650",
+         "-subj", "/CN=borderless"],
+        check=True, capture_output=True)
+    os.chmod(KEY_PATH, 0o600)
+
+
+
 
 CTRL_KEYS = {keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r}
 ALT_KEYS = {keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r, keyboard.Key.alt_gr}
@@ -65,20 +93,49 @@ MOUSE_MOVE_TYPES = {
 }
 
 
-def clipboard_get():
-    try:
-        return subprocess.run(
-            ["pbpaste"], capture_output=True, text=True, timeout=2
-        ).stdout
-    except Exception:
+class MacClipboard:
+    """Text and images on the macOS pasteboard. Images travel as Windows DIBs."""
+
+    def __init__(self):
+        self.pb = NSPasteboard.generalPasteboard()
+
+    def change_count(self):
+        return self.pb.changeCount()
+
+    def read(self):
+        text = self.pb.stringForType_(NSPasteboardTypeString)
+        if text is not None:
+            return "text", str(text).encode("utf-8")
+        for kind in (NSPasteboardTypePNG, NSPasteboardTypeTIFF):
+            data = self.pb.dataForType_(kind)
+            if data is None:
+                continue
+            rep = NSBitmapImageRep.imageRepWithData_(data)
+            if rep is None:
+                continue
+            bmp = rep.representationUsingType_properties_(NSBitmapImageFileTypeBMP, {})
+            if bmp is not None:
+                return "dib", bytes(bmp)[14:]
         return None
 
-
-def clipboard_set(text):
-    try:
-        subprocess.run(["pbcopy"], input=text, text=True, timeout=2)
-    except Exception:
-        pass
+    def write(self, fmt, data):
+        if fmt == "text":
+            self.pb.clearContents()
+            self.pb.setString_forType_(data.decode("utf-8", "replace"),
+                                       NSPasteboardTypeString)
+        elif fmt == "dib":
+            bmp = P.dib_to_bmp(P.make_dib_opaque(data))
+            rep = NSBitmapImageRep.imageRepWithData_(
+                NSData.dataWithBytes_length_(bmp, len(bmp)))
+            if rep is None:
+                raise ValueError("could not decode the image from Windows")
+            png = rep.representationUsingType_properties_(NSBitmapImageFileTypePNG, {})
+            self.pb.clearContents()
+            self.pb.setData_forType_(png, NSPasteboardTypePNG)
+            self.pb.setData_forType_(rep.TIFFRepresentation(), NSPasteboardTypeTIFF)
+        else:
+            raise ValueError(f"unknown clipboard format {fmt!r}")
+        return self.pb.changeCount()
 
 
 class Server:
@@ -93,24 +150,34 @@ class Server:
         self.enter_from = None       # display the cursor left the Mac from
         self.refresh_displays()
 
+        self.auth_key = P.derive_auth_key(args.key)
+        self.tls_ctx = None          # created in run(), after the certificate exists
+        self.cert_der = None
+
         self.speed = args.speed
         self.remote = False          # True while the Windows machine has control
         self.entered_at = 0.0        # when control last moved to Windows
-        self.conn = None
+        self.chan = None             # the authenticated main connection
         self.conn_lock = threading.Lock()
-        self.conn_hb = False         # client answers pings (older clients don't)
-        self.last_rx = 0.0           # when the active client last sent anything
-        self.win_w = 1920.0          # replaced by the client's hello
+
+        # Windows desktop, in physical pixels relative to its top-left corner.
+        self.win_w = 1920.0
         self.win_h = 1080.0
-        self.rx = 0.0                # virtual cursor position on the Windows screen
+        self.win_mons = [(0.0, 0.0, 1920.0, 1080.0)]
+        self.rx = 0.0                # virtual cursor position on the Windows desktop
         self.ry = 0.0
         self.park = (self.mac_w / 2.0, self.mac_h / 2.0)  # cursor clamp point
 
         self.sendq = queue.Queue(maxsize=2000)
         self.mouse_ctl = mouse.Controller()
         self.pressed = set()         # currently held modifier keys (local tracking)
-        self.last_clip_sent = None
-        self.last_clip_received = None
+
+        self.clipboard = MacClipboard()
+        self.clip_lock = threading.Lock()
+        self.clip_last_digest = None  # last clipboard content sent or received
+        self.clip_own_cc = None       # pasteboard change count of our own write
+        self.clip_offer = None        # (id, fmt, compressed) waiting to be fetched
+        self.clip_seq = 0
 
     # ---------------- networking ----------------
 
@@ -118,67 +185,100 @@ class Server:
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind((self.args.bind, self.args.port))
-        srv.listen(1)
-        print(f"[borderless] listening on {self.args.bind}:{self.args.port}")
+        srv.listen(4)
+        print(f"[borderless] listening on {self.args.bind}:{self.args.port} (TLS)")
         print(f"[borderless] Mac screen: {self.mac_w:.0f}x{self.mac_h:.0f}, "
               f"hand-off edge: {self.edge}")
         while True:
-            conn, addr = srv.accept()
-            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            print(f"[borderless] client connected from {addr[0]}")
-            threading.Thread(target=self.recv_loop, args=(conn,), daemon=True).start()
+            raw, addr = srv.accept()
+            threading.Thread(target=self.handle_conn, args=(raw, addr[0]),
+                             daemon=True).start()
 
-    def recv_loop(self, conn):
-        f = conn.makefile("r", encoding="utf-8", newline="\n")
-        authed = False
+    def handle_conn(self, raw, ip):
         try:
-            for line in f:
-                try:
-                    msg = json.loads(line)
-                except ValueError:
-                    continue
+            chan = P.accept_tls(raw, self.tls_ctx)
+        except (ssl.SSLError, OSError) as exc:
+            print(f"[borderless] TLS handshake with {ip} failed ({exc}). "
+                  f"Is client_windows.py up to date?")
+            raw.close()
+            return
+        try:
+            hello = P.authenticate_server(chan, self.auth_key, self.cert_der)
+        except P.AuthError as exc:
+            print(f"[borderless] rejected {ip}: {exc}")
+            chan.close()
+            return
+        except (OSError, ConnectionError, ValueError) as exc:
+            print(f"[borderless] handshake with {ip} failed: {exc}")
+            chan.close()
+            return
+        if hello.get("role") == "data":
+            self.handle_data(chan)
+        else:
+            self.main_loop(chan, hello, ip)
+
+    def main_loop(self, chan, hello, ip):
+        self.update_win_screens(hello)
+        with self.conn_lock:
+            old, self.chan = self.chan, chan
+        if old is not None:
+            old.close()
+        print(f"[borderless] client {ip} paired — Windows desktop "
+              f"{self.win_w:.0f}x{self.win_h:.0f} on {len(self.win_mons)} "
+              f"display(s). Move the cursor off the {self.edge} edge.")
+        try:
+            while True:
+                msg = chan.recv_msg(timeout=P.HEARTBEAT_TIMEOUT)
                 t = msg.get("t")
-                if authed:
-                    self.last_rx = time.time()
-                if t == "hello":
-                    if self.args.token and msg.get("token") != self.args.token:
-                        print("[borderless] client rejected: bad token")
-                        conn.close()
-                        return
-                    self.win_w = float(msg.get("w", 1920))
-                    self.win_h = float(msg.get("h", 1080))
-                    with self.conn_lock:
-                        old = self.conn
-                        self.conn = conn
-                        self.conn_hb = bool(msg.get("hb"))
-                        self.last_rx = time.time()
-                    if not self.conn_hb:
-                        print("[borderless] note: client is an older version without "
-                              "heartbeat support; update client_windows.py")
-                    if old:
-                        try:
-                            old.close()
-                        except OSError:
-                            pass
-                    authed = True
-                    print(f"[borderless] windows screen: "
-                          f"{self.win_w:.0f}x{self.win_h:.0f} — ready. "
-                          f"Move the cursor off the {self.edge} edge.")
-                elif t == "clip" and authed:
-                    text = msg.get("text", "")
-                    if text != self.last_clip_received:
-                        self.last_clip_received = text
-                        self.last_clip_sent = text
-                        clipboard_set(text)
-        except OSError:
+                if t == "clip":
+                    try:
+                        self.apply_clip(msg["fmt"], P.decompress(P.unb64(msg["data"])))
+                    except Exception as exc:
+                        print(f"[borderless] could not apply clipboard from Windows: {exc}")
+                elif t == "screens":
+                    self.update_win_screens(msg)
+                    print(f"[borderless] Windows desktop changed: "
+                          f"{self.win_w:.0f}x{self.win_h:.0f} on "
+                          f"{len(self.win_mons)} display(s)")
+        except socket.timeout:
+            print(f"[borderless] no reply from client for "
+                  f"{P.HEARTBEAT_TIMEOUT:.0f}s — dropping the connection")
+        except (OSError, ConnectionError):
             pass
         finally:
+            chan.close()
             with self.conn_lock:
-                if self.conn is conn:
-                    self.conn = None
+                if self.chan is chan:
+                    self.chan = None
                     if self.remote:
                         self.exit_remote(reason="client disconnected")
             print("[borderless] client disconnected")
+
+    def handle_data(self, chan):
+        """Serve one bulk clipboard transfer, then close."""
+        try:
+            req = chan.recv_msg(timeout=P.AUTH_TIMEOUT)
+            if req.get("t") == "fetch":
+                offer = self.clip_offer
+                if offer is None or offer[0] != req.get("id"):
+                    chan.send({"t": "blob", "ok": False})
+                    return
+                _, fmt, blob = offer
+                chan.send({"t": "blob", "ok": True, "fmt": fmt, "size": len(blob)})
+                chan.send_bytes(blob, timeout=120)
+                chan.recv_msg(timeout=120)  # wait for "done" so nothing is cut off
+            elif req.get("t") == "push":
+                size = int(req.get("size", 0))
+                if not 0 < size <= P.MAX_CLIP_SIZE:
+                    chan.send({"t": "done", "ok": False})
+                    return
+                blob = chan.recv_exact(size, timeout=120)
+                chan.send({"t": "done", "ok": True})
+                self.apply_clip(req["fmt"], P.decompress(blob))
+        except Exception as exc:
+            print(f"[borderless] clipboard transfer failed: {exc}")
+        finally:
+            chan.close()
 
     def send(self, msg):
         try:
@@ -211,47 +311,70 @@ class Server:
 
     def _send_now(self, msg):
         with self.conn_lock:
-            conn = self.conn
-        if conn is None:
+            chan = self.chan
+        if chan is None:
             return
         try:
-            conn.sendall((json.dumps(msg, separators=(",", ":")) + "\n").encode())
-        except OSError:
-            with self.conn_lock:
-                if self.conn is conn:
-                    self.conn = None
-            if self.remote:
-                self.exit_remote(reason="send failed")
+            chan.send(msg, timeout=2.0)
+        except (OSError, ConnectionError):
+            # A send that can't complete means the link is dead; closing the
+            # channel makes main_loop clean up and return control to the Mac.
+            chan.close()
 
     def heartbeat_loop(self):
         while True:
-            time.sleep(HEARTBEAT_INTERVAL)
-            with self.conn_lock:
-                conn = self.conn
-                hb = self.conn_hb
-                silent = time.time() - self.last_rx
-            if conn is None:
-                continue
-            self.send({"t": "ping"})
-            if not hb or silent <= HEARTBEAT_TIMEOUT:
-                continue
-            print(f"[borderless] no reply from client for {silent:.0f}s — "
-                  f"dropping the connection")
-            with self.conn_lock:
-                if self.conn is conn:
-                    self.conn = None
-                    if self.remote:
-                        self.exit_remote(reason="heartbeat timeout")
-            # A dead peer never sends FIN, so the reader and writer threads can
-            # block indefinitely; shutdown() unblocks both.
-            try:
-                conn.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            try:
-                conn.close()
-            except OSError:
-                pass
+            time.sleep(P.HEARTBEAT_INTERVAL)
+            if self.chan is not None:
+                self.send({"t": "ping"})
+
+    # ---------------- Windows desktop geometry ----------------
+
+    def update_win_screens(self, msg):
+        mons = msg.get("mons") or [[0, 0, msg.get("vw", 1920), msg.get("vh", 1080)]]
+        mons = [tuple(float(v) for v in m[:4]) for m in mons if m[2] > 0 and m[3] > 0]
+        if not mons:
+            return
+        self.win_mons = mons
+        self.win_w = float(msg.get("vw") or max(x + w for x, _, w, _ in mons))
+        self.win_h = float(msg.get("vh") or max(y + h for _, y, _, h in mons))
+        if self.remote:
+            self.rx, self.ry = self.win_clamp(self.rx, self.ry)
+
+    def win_mon_at(self, x, y):
+        for m in self.win_mons:
+            mx, my, mw, mh = m
+            if mx <= x < mx + mw and my <= y < my + mh:
+                return m
+        return None
+
+    def win_clamp(self, x, y, current=None):
+        """Keep (x, y) on a Windows display.
+
+        Like Windows itself, the cursor only moves onto another display when
+        the new point lies inside it; otherwise it stays pinned to the edge of
+        the display it is on. With no current display, use the nearest one.
+        """
+        if self.win_mon_at(x, y) is not None:
+            return x, y
+        if current is not None:
+            mx, my, mw, mh = current
+            return max(mx, min(mx + mw - 1, x)), max(my, min(my + mh - 1, y))
+        best = None
+        for mx, my, mw, mh in self.win_mons:
+            cx = max(mx, min(mx + mw - 1, x))
+            cy = max(my, min(my + mh - 1, y))
+            dist = (cx - x) ** 2 + (cy - y) ** 2
+            if best is None or dist < best[0]:
+                best = (dist, cx, cy)
+        return best[1], best[2]
+
+    def send_move(self):
+        # 0–65535 across the whole Windows virtual desktop, independent of
+        # resolution and display scaling (the scale SendInput expects).
+        nx = int((self.rx + 0.5) * 65536 / self.win_w)
+        ny = int((self.ry + 0.5) * 65536 / self.win_h)
+        self.send({"t": "move", "x": max(0, min(65535, nx)),
+                   "y": max(0, min(65535, ny))})
 
     # ---------------- displays ----------------
 
@@ -282,11 +405,15 @@ class Server:
 
     def enter_remote(self, rel_y, from_display):
         with self.conn_lock:
-            if self.conn is None:
+            if self.chan is None:
                 return
         self.enter_from = from_display
-        self.ry = max(0.0, min(self.win_h - 1, rel_y * self.win_h))
-        self.rx = 15.0 if self.edge == "right" else self.win_w - 16.0
+        right = self.edge == "right"
+        # Land just inside the Windows edge that faces the Mac, on whichever
+        # Windows display is at that height.
+        x0, y0 = self.win_clamp(0.0 if right else self.win_w - 1,
+                                max(0.0, min(1.0, rel_y)) * self.win_h)
+        self.rx, self.ry = self.win_clamp(x0 + 15 if right else x0 - 15, y0)
         self.entered_at = time.time()
         self.remote = True
         # Suppressing the events isn't enough: the WindowServer moves the cursor
@@ -304,7 +431,7 @@ class Server:
         park_y = pdy + max(0.0, min(1.0, rel_y)) * pdh
         self.park = (park_x, park_y)
         self.freeze_cursor(True)
-        self.send({"t": "move", "x": int(self.rx), "y": int(self.ry)})
+        self.send_move()
         print("[borderless] → control handed to Windows")
 
     def exit_remote(self, reason="edge"):
@@ -410,20 +537,26 @@ class Server:
             return event
 
     def remote_move(self, dx, dy):
-        self.rx += dx
-        self.ry += dy
+        nx = self.rx + dx
+        ny = self.ry + dy
+        cur = self.win_mon_at(self.rx, self.ry) or self.win_mons[0]
         # Brief grace period after hand-off so edge jitter can't bounce
         # control straight back to the Mac.
-        can_return = time.time() - self.entered_at > 0.3
-        if can_return and self.edge == "right" and self.rx <= 0:
-            self.exit_remote()
-            return
-        if can_return and self.edge == "left" and self.rx >= self.win_w - 1:
-            self.exit_remote()
-            return
-        self.rx = max(0.0, min(self.win_w - 1, self.rx))
-        self.ry = max(0.0, min(self.win_h - 1, self.ry))
-        self.send({"t": "move", "x": int(self.rx), "y": int(self.ry)})
+        if time.time() - self.entered_at > 0.3:
+            mx, my, mw, mh = cur
+            edge_y = max(my, min(my + mh - 1, ny))
+            # Return only past the outer edge of the Windows display the cursor
+            # is on, where no other Windows display continues the desktop.
+            if (self.edge == "right" and nx < mx
+                    and self.win_mon_at(nx, edge_y) is None):
+                self.exit_remote()
+                return
+            if (self.edge == "left" and nx >= mx + mw
+                    and self.win_mon_at(nx, edge_y) is None):
+                self.exit_remote()
+                return
+        self.rx, self.ry = self.win_clamp(nx, ny, cur)
+        self.send_move()
 
     # ---------------- keyboard ----------------
 
@@ -456,8 +589,8 @@ class Server:
     @staticmethod
     def key_fields(key):
         # "mvk" is the physical macOS key code, which the client maps to a
-        # Windows scan code. The name/char fields stay as a fallback for media
-        # keys and for clients that predate scan-code support.
+        # Windows scan code. The name/char fields are the fallback for media
+        # keys, which have no key code.
         if isinstance(key, keyboard.Key):
             fields = {"name": key.name}
             code = key.value
@@ -478,15 +611,55 @@ class Server:
     # ---------------- clipboard ----------------
 
     def clip_loop(self):
-        self.last_clip_sent = clipboard_get()
+        last_cc = self.clipboard.change_count()
         while True:
-            time.sleep(1.0)
-            text = clipboard_get()
-            if text is None or text == self.last_clip_sent:
+            time.sleep(0.5)
+            cc = self.clipboard.change_count()
+            if cc == last_cc:
                 continue
-            self.last_clip_sent = text
-            if text != self.last_clip_received:
-                self.send({"t": "clip", "text": text})
+            last_cc = cc
+            with self.clip_lock:
+                if cc == self.clip_own_cc:
+                    continue
+            try:
+                item = self.clipboard.read()
+            except Exception as exc:
+                print(f"[borderless] could not read the Mac clipboard: {exc}")
+                continue
+            if item is None:
+                continue
+            fmt, data = item
+            if len(data) > P.MAX_CLIP_SIZE:
+                print(f"[borderless] clipboard too large to share "
+                      f"({P.human_size(len(data))})")
+                continue
+            digest = P.clip_digest(fmt, data)
+            with self.clip_lock:
+                if digest == self.clip_last_digest:
+                    continue
+                self.clip_last_digest = digest
+            self.offer_clip(fmt, data)
+
+    def offer_clip(self, fmt, data):
+        if self.chan is None:
+            return
+        blob = P.compress(data)
+        if len(blob) <= P.INLINE_CLIP_LIMIT:
+            self.send({"t": "clip", "fmt": fmt, "data": P.b64(blob)})
+        else:
+            # Too big for the main link: announce it, and the client fetches
+            # it over a separate connection.
+            self.clip_seq += 1
+            self.clip_offer = (self.clip_seq, fmt, blob)
+            self.send({"t": "clipoffer", "id": self.clip_seq, "fmt": fmt,
+                       "size": len(blob)})
+        print(f"[borderless] clipboard → Windows ({fmt}, {P.human_size(len(data))})")
+
+    def apply_clip(self, fmt, data):
+        with self.clip_lock:
+            self.clip_last_digest = P.clip_digest(fmt, data)
+            self.clip_own_cc = self.clipboard.write(fmt, data)
+        print(f"[borderless] clipboard ← Windows ({fmt}, {P.human_size(len(data))})")
 
     # ---------------- lifecycle ----------------
 
@@ -500,6 +673,11 @@ class Server:
             requester = getattr(Quartz, "CGRequestListenEventAccess", None)
             if requester is not None:
                 requester()
+
+        ensure_certificate()
+        self.tls_ctx = P.server_context(CERT_PATH, KEY_PATH)
+        with open(CERT_PATH) as f:
+            self.cert_der = ssl.PEM_cert_to_DER_cert(f.read())
 
         import atexit
         atexit.register(self.freeze_cursor, False)
@@ -529,6 +707,14 @@ class Server:
             self.freeze_cursor(False)
 
 
+def print_key_banner(key):
+    line = "─" * 44
+    print(f"[borderless] {line}")
+    print("[borderless] Pairing key — enter it on the Windows machine:")
+    print(f"[borderless]     {key}")
+    print(f"[borderless] {line}")
+
+
 def main():
     cfg = load_config()
     p = argparse.ArgumentParser(description=__doc__)
@@ -539,13 +725,33 @@ def main():
                    default=cfg.get("edge", "right"),
                    help="which side of the Mac the Windows machine sits on "
                         "(cross that edge to hand off control)")
-    p.add_argument("--token", default=cfg.get("token", ""),
-                   help="shared secret; client must send the same")
     p.add_argument("--speed", type=float, default=cfg.get("speed", 1.0),
                    help="mouse speed multiplier on the Windows screen")
+    p.add_argument("--key", help="use this pairing key instead of the saved one")
+    p.add_argument("--new-key", action="store_true",
+                   help="generate a new pairing key (the client must be updated)")
+    p.add_argument("--show-key", action="store_true",
+                   help="print the saved pairing key")
+    p.add_argument("--token", help=argparse.SUPPRESS)
     args = p.parse_args()
+
+    if args.token:
+        print("[borderless] note: --token is no longer used; the connection is "
+              "now paired with a key (see below)")
+    if args.key and not P.key_is_valid(args.key):
+        p.error("--key needs at least 16 characters from: " + P.KEY_ALPHABET +
+                " (or use --new-key to generate one)")
+
+    key = args.key or cfg.get("key")
+    new_key = args.new_key or not P.key_is_valid(key or "")
+    if new_key and not args.key:
+        key = P.generate_key()
+    args.key = P.format_key(key)
+
     save_config({"edge": args.edge, "speed": args.speed, "port": args.port,
-                 "token": args.token})
+                 "key": args.key}, remove=("token", "panel_port"))
+    if new_key or args.show_key:
+        print_key_banner(args.key)
     Server(args).run()
 
 

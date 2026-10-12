@@ -1,5 +1,8 @@
-# Local settings, including the shared token
+# Local settings and secrets: pairing key, TLS private key and certificate
 config.json
+client_config.json
+tls_cert.pem
+tls_key.pem
 
 # Python
 .venv/

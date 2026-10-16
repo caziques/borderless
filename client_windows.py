@@ -31,8 +31,10 @@ CF_DIB = 8
 CF_DIBV5 = 17
 GMEM_MOVEABLE = 0x0002
 
-_user32 = ctypes.windll.user32
-_kernel32 = ctypes.windll.kernel32
+# Private handles: ctypes.windll shares one function object per API with
+# pynput, so argtypes set here would replace pynput's and break its SendInput.
+_user32 = ctypes.WinDLL("user32", use_last_error=True)
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 _user32.GetClipboardData.restype = ctypes.c_void_p
 _user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
 _user32.SetClipboardData.restype = ctypes.c_void_p
@@ -612,8 +614,17 @@ class Client:
             self.chan = chan
         print("[borderless] connected and paired (TLS) — waiting for the Mac "
               "to hand over control")
+        errors_reported = set()
         while True:
-            self.handle(chan.recv_msg(timeout=P.HEARTBEAT_TIMEOUT))
+            msg = chan.recv_msg(timeout=P.HEARTBEAT_TIMEOUT)
+            try:
+                self.handle(msg)
+            except Exception as exc:
+                kind = (msg.get("t"), type(exc).__name__)
+                if kind not in errors_reported:
+                    errors_reported.add(kind)
+                    print(f"[borderless] could not handle a {msg.get('t')!r} "
+                          f"event: {exc!r}")
 
 
 def main():

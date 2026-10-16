@@ -245,6 +245,127 @@ def move_abs(nx, ny):
     _user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
 
 
+def move_rel(dx, dy):
+    inp = INPUT(type=INPUT_MOUSE)
+    inp.u.mi = MOUSEINPUT(dx=dx, dy=dy, mouseData=0, dwFlags=MOUSEEVENTF_MOVE,
+                          time=0, dwExtraInfo=0)
+    _user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+
+
+# ---------------- cursor visibility ----------------
+
+SM_MOUSEPRESENT = 19
+CURSOR_SHOWING = 0x1
+CURSOR_SUPPRESSED = 0x2
+SPI_GETMOUSEKEYS = 0x0036
+SPI_SETMOUSEKEYS = 0x0037
+SPIF_SENDCHANGE = 0x2
+MKF_MOUSEKEYSON = 0x01
+MKF_AVAILABLE = 0x02
+MKF_INDICATOR = 0x20
+MKF_REPLACENUMBERS = 0x80
+VK_NUMLOCK = 0x90
+
+
+class CURSORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD),
+                ("hCursor", wintypes.HANDLE), ("ptScreenPos", wintypes.POINT)]
+
+
+class MOUSEKEYS(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.UINT), ("dwFlags", wintypes.DWORD),
+                ("iMaxSpeed", wintypes.DWORD), ("iTimeToMaxSpeed", wintypes.DWORD),
+                ("iCtrlSpeed", wintypes.DWORD), ("dwReserved1", wintypes.DWORD),
+                ("dwReserved2", wintypes.DWORD)]
+
+
+def cursor_flags():
+    info = CURSORINFO(cbSize=ctypes.sizeof(CURSORINFO))
+    if not _user32.GetCursorInfo(ctypes.byref(info)):
+        return None
+    return info.flags
+
+
+class CursorFix:
+    """Keep the Windows pointer visible while the Mac controls this machine.
+
+    Windows doesn't draw the pointer when no mouse is attached, and hides it
+    after touch input. Injected input fixes neither on its own. While Windows
+    has control, this turns on Mouse Keys (which makes Windows draw the
+    pointer) and restores the user's setting when control returns to the Mac.
+    SPIF_SENDCHANGE without SPIF_UPDATEINIFILE means the change is never
+    saved, so a crash or reboot also restores the original setting.
+    """
+
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+        self.saved = None          # the user's MOUSEKEYS, while ours is applied
+        self.reported = False
+
+    def enter(self):
+        if not self.enabled:
+            return
+        flags = cursor_flags()
+        if flags is None or flags & CURSOR_SHOWING:
+            self._report(flags, "visible")
+            return
+        if flags & CURSOR_SUPPRESSED:
+            # Hidden after touch or pen input; any relative mouse movement
+            # brings it back.
+            move_rel(1, 0)
+            move_rel(-1, 0)
+            flags = cursor_flags()
+            if flags is None or flags & CURSOR_SHOWING:
+                self._report(flags, "was hidden after touch input; nudged it back")
+                return
+        if self._mouse_keys_on():
+            self._report(cursor_flags(), "was hidden (no mouse attached); "
+                                         "turned on Mouse Keys to show it")
+        else:
+            self._report(cursor_flags(), "is hidden, and Mouse Keys could not "
+                                         "be turned on")
+
+    def leave(self):
+        if self.saved is None:
+            return
+        saved, self.saved = self.saved, None
+        _user32.SystemParametersInfoW(SPI_SETMOUSEKEYS, ctypes.sizeof(saved),
+                                      ctypes.byref(saved), SPIF_SENDCHANGE)
+
+    def _mouse_keys_on(self):
+        if self.saved is not None:
+            return True
+        current = MOUSEKEYS(cbSize=ctypes.sizeof(MOUSEKEYS))
+        if not _user32.SystemParametersInfoW(SPI_GETMOUSEKEYS, current.cbSize,
+                                             ctypes.byref(current), 0):
+            return False
+        if current.dwFlags & MKF_MOUSEKEYSON:
+            return False  # already on by the user's choice; leave it alone
+        saved = MOUSEKEYS.from_buffer_copy(current)
+        ours = MOUSEKEYS.from_buffer_copy(current)
+        ours.dwFlags = (current.dwFlags | MKF_MOUSEKEYSON | MKF_AVAILABLE) & ~MKF_INDICATOR
+        # Mouse Keys takes over the numeric keypad in one Num Lock state:
+        # with MKF_REPLACENUMBERS, when Num Lock is on. Pick the state Num Lock
+        # is not in now, so the keypad keeps typing as it does.
+        if _user32.GetKeyState(VK_NUMLOCK) & 1:
+            ours.dwFlags &= ~MKF_REPLACENUMBERS
+        else:
+            ours.dwFlags |= MKF_REPLACENUMBERS
+        if _user32.SystemParametersInfoW(SPI_SETMOUSEKEYS, ours.cbSize,
+                                         ctypes.byref(ours), SPIF_SENDCHANGE):
+            self.saved = saved
+            return True
+        return False
+
+    def _report(self, flags, what):
+        if self.reported:
+            return
+        self.reported = True
+        present = "yes" if _user32.GetSystemMetrics(SM_MOUSEPRESENT) else "no"
+        print(f"[borderless] pointer {what} (mouse attached: {present}, "
+              f"cursor flags: {flags})")
+
+
 # ---------------- displays ----------------
 
 def set_dpi_aware():
@@ -326,6 +447,8 @@ class Client:
         self.args = args
         self.mouse = mouse.Controller()
         self.kb = keyboard.Controller()
+        self.cursor = CursorFix(enabled=args.show_cursor)
+        self.active = False        # True while the Mac has handed us control
         self.auth_key = P.derive_auth_key(args.key)
         self.tls_ctx = P.client_context()
         self.layout = desktop_layout(args.size)
@@ -371,6 +494,9 @@ class Client:
         t = msg.get("t")
         if t == "move":
             move_abs(int(msg["x"]), int(msg["y"]))
+            if not self.active:
+                self.active = True
+                self.cursor.enter()
         elif t == "click":
             btn = BUTTONS.get(msg.get("b", 0), mouse.Button.left)
             if msg.get("d"):
@@ -448,6 +574,11 @@ class Client:
             except Exception:
                 pass
         self.pressed_buttons.clear()
+        self.active = False
+        try:
+            self.cursor.leave()
+        except Exception as exc:
+            print(f"[borderless] could not restore Mouse Keys: {exc!r}")
 
     # ---------------- clipboard ----------------
 
@@ -640,10 +771,12 @@ def main():
                    help="flip scroll direction if it feels backwards")
     p.add_argument("--size", default="",
                    help="override the detected desktop, e.g. --size 1920x1080")
+    p.add_argument("--no-show-cursor", dest="show_cursor", action="store_false",
+                   help="don't turn on Mouse Keys to make the pointer visible")
     p.add_argument("--no-swap-cmd-ctrl", dest="swap_cmd_ctrl", action="store_false",
                    help="send Mac Cmd as the Windows key instead of Ctrl")
     p.add_argument("--token", help=argparse.SUPPRESS)
-    p.set_defaults(swap_cmd_ctrl=True)
+    p.set_defaults(swap_cmd_ctrl=True, show_cursor=True)
     args = p.parse_args()
 
     if args.token:
@@ -659,7 +792,13 @@ def main():
     save_config({"server": args.server, "key": args.key, "port": args.port})
 
     set_dpi_aware()
-    Client(args).run()
+    client = Client(args)
+    import atexit
+    atexit.register(client.cursor.leave)
+    try:
+        client.run()
+    except KeyboardInterrupt:
+        print("\n[borderless] stopped")
 
 
 if __name__ == "__main__":

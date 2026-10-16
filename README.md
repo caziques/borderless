@@ -102,6 +102,13 @@ Mac.
 - **Keyboard layout:** keys are sent as physical key positions (scan codes),
   and Windows applies its own keyboard layout. Set the Windows layout to match
   your Mac keyboard.
+- **Pointer on Windows:** Windows doesn't draw the pointer when no mouse is
+  attached to it. While Windows has control, the client turns on the Mouse
+  Keys accessibility feature, which makes Windows draw the pointer, and
+  restores your setting when control returns to the Mac. The change is never
+  saved, so a restart also restores it. While it's on, the numeric keypad
+  works as usual in the current Num Lock state; switching Num Lock makes the
+  keypad move the pointer instead.
 - **Dropped connections:** the two machines exchange a heartbeat every second.
   If the network drops while Windows has control, the Mac takes control back
   after about 4 seconds, and Windows releases any held keys or mouse buttons.
@@ -128,6 +135,7 @@ Client (`client_windows.py`):
 | `--port` | 24801 | Must match the server |
 | `--invert-scroll` | off | Reverse the scroll direction |
 | `--no-swap-cmd-ctrl` | off | Send Cmd as the Windows key instead of Ctrl |
+| `--no-show-cursor` | off | Don't turn on Mouse Keys to show the pointer |
 | `--size` | detected | Override the detected desktop size, for example `1920x1080` |
 
 ## Security

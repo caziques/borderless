@@ -177,8 +177,9 @@ Client (`client_windows.py`):
 - The clipboard is limited to text and images up to 100 MB. Files and drag
   and drop between machines aren't supported.
 - Image transparency isn't kept between machines.
-- Injected input can't reach elevated (administrator) windows on Windows
-  unless the client runs as administrator.
+- Injected input can't reach elevated (administrator) windows, the sign-in
+  screen, or the lock screen on Windows. Elevated windows work if the client
+  runs as administrator.
 - Media keys (volume, play/pause) arrive as Windows media keys. The Mac `fn`
   key has no Windows equivalent and isn't forwarded.
 - On ISO keyboards, the `§` key maps to the extra ISO key next to left Shift.

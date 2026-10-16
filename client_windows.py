@@ -366,6 +366,123 @@ class CursorFix:
               f"cursor flags: {flags})")
 
 
+# ---------------- screensaver ----------------
+
+SPI_GETSCREENSAVERRUNNING = 0x0072
+WM_CLOSE = 0x0010
+DESKTOP_READOBJECTS = 0x0001
+DESKTOP_WRITEOBJECTS = 0x0080
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+_user32.OpenDesktopW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.BOOL,
+                                 wintypes.DWORD]
+_user32.OpenDesktopW.restype = wintypes.HANDLE
+_user32.CloseDesktop.argtypes = [wintypes.HANDLE]
+_user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+                                 wintypes.LPARAM]
+_user32.GetForegroundWindow.restype = wintypes.HWND
+_user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND,
+                                             ctypes.POINTER(wintypes.DWORD)]
+_kernel32.OpenProcess.restype = wintypes.HANDLE
+_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+_ENUM_WINDOWS_PROC = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)(
+    wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+
+def screensaver_running():
+    running = wintypes.BOOL(0)
+    if not _user32.SystemParametersInfoW(SPI_GETSCREENSAVERRUNNING, 0,
+                                         ctypes.byref(running), 0):
+        return False
+    return bool(running.value)
+
+
+def _window_class(hwnd):
+    buf = ctypes.create_unicode_buffer(256)
+    _user32.GetClassNameW(hwnd, buf, 256)
+    return buf.value
+
+
+def _window_exe(hwnd):
+    pid = wintypes.DWORD(0)
+    _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if not pid.value:
+        return ""
+    proc = _kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+    if not proc:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        size = wintypes.DWORD(1024)
+        if _kernel32.QueryFullProcessImageNameW(proc, 0, buf, ctypes.byref(size)):
+            return buf.value
+        return ""
+    finally:
+        _kernel32.CloseHandle(proc)
+
+
+def close_screensaver():
+    """Ask a running screensaver to close; returns how many windows were asked.
+
+    Microsoft's documented method: a password-protected screensaver runs on
+    its own "Screen-saver" desktop, which injected input can't reach, so post
+    WM_CLOSE to its windows there. Otherwise it runs on the normal desktop as
+    a window of class WindowsScreenSaverClass, or as a .scr process.
+    """
+    asked = []
+
+    def close_visible(hwnd, _):
+        if _user32.IsWindowVisible(hwnd):
+            _user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+            asked.append(hwnd)
+        return True
+
+    def close_saver_class(hwnd, _):
+        if _window_class(hwnd) == "WindowsScreenSaverClass":
+            _user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+            asked.append(hwnd)
+        return True
+
+    desk = _user32.OpenDesktopW("Screen-saver", 0, False,
+                                DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS)
+    if desk:
+        try:
+            _user32.EnumDesktopWindows(desk, _ENUM_WINDOWS_PROC(close_visible), 0)
+        finally:
+            _user32.CloseDesktop(desk)
+    _user32.EnumWindows(_ENUM_WINDOWS_PROC(close_saver_class), 0)
+    if not asked:
+        fg = _user32.GetForegroundWindow()
+        if fg and _window_exe(fg).lower().endswith(".scr"):
+            _user32.PostMessageW(fg, WM_CLOSE, 0, 0)
+            asked.append(fg)
+    return len(asked)
+
+
+class ScreensaverWaker:
+    """Close the Windows screensaver when input arrives from the Mac."""
+
+    CHECK_INTERVAL = 0.5
+
+    def __init__(self):
+        self.last_check = 0.0
+
+    def poke(self, force=False):
+        now = time.monotonic()
+        if not force and now - self.last_check < self.CHECK_INTERVAL:
+            return
+        self.last_check = now
+        if not screensaver_running():
+            return
+        asked = close_screensaver()
+        if asked:
+            print(f"[borderless] closed the screensaver ({asked} window(s))")
+        else:
+            print("[borderless] the screensaver is running, but its window "
+                  "couldn't be found to close it")
+
+
 # ---------------- displays ----------------
 
 def set_dpi_aware():
@@ -448,6 +565,7 @@ class Client:
         self.mouse = mouse.Controller()
         self.kb = keyboard.Controller()
         self.cursor = CursorFix(enabled=args.show_cursor)
+        self.waker = ScreensaverWaker()
         self.active = False        # True while the Mac has handed us control
         self.auth_key = P.derive_auth_key(args.key)
         self.tls_ctx = P.client_context()
@@ -492,6 +610,11 @@ class Client:
 
     def handle(self, msg):
         t = msg.get("t")
+        if t in ("move", "click", "scroll", "key"):
+            try:
+                self.waker.poke(force=not self.active)
+            except Exception as exc:
+                print(f"[borderless] screensaver check failed: {exc!r}")
         if t == "move":
             move_abs(int(msg["x"]), int(msg["y"]))
             if not self.active:

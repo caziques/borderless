@@ -109,6 +109,11 @@ Mac.
   saved, so a restart also restores it. While it's on, the numeric keypad
   works as usual in the current Num Lock state; switching Num Lock makes the
   keypad move the pointer instead.
+- **Screensaver on Windows:** when input from the Mac arrives while the
+  Windows screensaver is running, the client closes the screensaver. If
+  Windows is set to show the sign-in screen when the screensaver ends, you
+  need to sign in on the Windows machine itself, because the client can't
+  send input to the sign-in screen.
 - **Dropped connections:** the two machines exchange a heartbeat every second.
   If the network drops while Windows has control, the Mac takes control back
   after about 4 seconds, and Windows releases any held keys or mouse buttons.
